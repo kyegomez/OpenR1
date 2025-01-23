@@ -56,3 +56,25 @@ actions, probs = grpo.sample_actions(states, num_samples=3)
 print(f"Sampled actions shape: {actions.shape}")  # [4, 3]
 print(f"Action probabilities shape: {probs.shape}")  # [4, 3, 2]
 ```
+
+
+## Diagram
+
+
+```mermaid
+sequenceDiagram
+    participant Input as Input Data
+    participant Policy as Policy Network
+    participant Group as Group Processing
+    participant Loss as Loss Computation
+    participant Optim as Optimizer
+    
+    Input->>Policy: Forward Pass
+    Policy->>Group: Generate Group Samples
+    Group->>Group: Compute Statistics
+    Group->>Loss: Calculate Advantages
+    Policy->>Loss: Compute KL Divergence
+    Loss->>Loss: Compute Total Loss
+    Loss->>Optim: Backward Pass
+    Optim->>Policy: Update Parameters
+```

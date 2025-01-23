@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from openr1 import GRPO
+from openr1.main import GRPO
 
 # Simple po`licy network
 class PolicyNet(nn.Module):
