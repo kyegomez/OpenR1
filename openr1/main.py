@@ -1,66 +1,77 @@
 """
-Group Relative Policy Optimization (GRPO) implementation in PyTorch.
-
-This module implements GRPO as described in the paper, providing a policy optimization
-algorithm that foregoes the critic model and estimates the baseline from group scores.
+GRPO implementation specifically designed for Language Models, handling token-based
+generation and appropriate masking for variable-length sequences.
 """
 
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
-from typing import Tuple, Optional, Dict
+from torch.nn import functional as F
+from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
 from loguru import logger
+from transformers import PreTrainedModel, PreTrainedTokenizer
 
 @dataclass
 class GRPOConfig:
-    """Configuration for GRPO algorithm."""
-    epsilon: float = 0.2  # Clipping parameter
-    beta: float = 0.01    # KL penalty coefficient
-    group_size: int = 16  # Number of outputs to sample per question
+    """Configuration for LLM-specific GRPO."""
+    epsilon: float = 0.2          # Clipping parameter
+    beta: float = 0.01           # KL penalty coefficient
+    group_size: int = 16         # Number of generations per prompt
     learning_rate: float = 3e-4
     max_grad_norm: float = 0.5
+    max_sequence_length: int = 512
+    pad_token_id: int = 0
+    temperature: float = 0.6     # Sampling temperature
+    top_p: float = 0.9          # Nucleus sampling parameter
 
 class GRPO:
     """
-    Implementation of Group Relative Policy Optimization.
+    GRPO implementation specialized for Language Models.
     
-    Attributes:
-        policy (nn.Module): Policy network that outputs action probabilities
-        optimizer (torch.optim.Optimizer): Optimizer for policy network
-        config (GRPOConfig): Configuration parameters
-        device (torch.device): Device to run computations on
+    This implementation handles:
+    - Token-based generation
+    - Proper masking for variable-length sequences
+    - Integration with HuggingFace models
     """
     
     def __init__(
         self,
-        policy: nn.Module,
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
         config: Optional[GRPOConfig] = None,
         device: Optional[torch.device] = None
     ):
-        self.policy = policy
+        self.model = model
+        self.tokenizer = tokenizer
         self.config = config or GRPOConfig()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.policy.to(self.device)
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.config.learning_rate)
+        self.model.to(self.device)
         
-        logger.info(f"Initialized GRPO with device: {self.device}")
-        logger.info(f"Config: {self.config}")
+        # Initialize optimizer with weight decay for non-bias parameters
+        param_groups = [
+            {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in ['bias', 'LayerNorm'])], 'weight_decay': 0.01},
+            {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in ['bias', 'LayerNorm'])], 'weight_decay': 0.0}
+        ]
+        self.optimizer = torch.optim.AdamW(param_groups, lr=self.config.learning_rate)
+        
+        logger.info(f"Initialized LLM GRPO with device: {self.device}")
 
-    def compute_advantages(
+    def compute_sequence_level_advantages(
         self,
         rewards: torch.Tensor,
-        group_indices: torch.Tensor
+        group_indices: torch.Tensor,
+        attention_mask: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute advantages using group rewards.
+        Compute advantages for complete sequences.
         
         Args:
-            rewards: Tensor of shape (batch_size,) containing rewards
+            rewards: Tensor of shape (batch_size,) containing sequence-level rewards
             group_indices: Tensor of shape (batch_size,) containing group indices
+            attention_mask: Tensor of shape (batch_size, seq_len) for masking
             
         Returns:
-            Tensor of shape (batch_size,) containing advantage estimates
+            Tensor of shape (batch_size,) containing sequence-level advantages
         """
         advantages = torch.zeros_like(rewards)
         unique_groups = torch.unique(group_indices)
@@ -69,7 +80,7 @@ class GRPO:
             mask = group_indices == group_idx
             group_rewards = rewards[mask]
             
-            # Compute advantage as (reward - mean) / std
+            # Normalize advantages within each group
             mean_reward = group_rewards.mean()
             std_reward = group_rewards.std()
             if std_reward > 0:
@@ -79,99 +90,94 @@ class GRPO:
                 
         return advantages
 
+    def compute_token_level_advantages(
+        self,
+        sequence_advantages: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Expand sequence-level advantages to token level.
+        
+        Args:
+            sequence_advantages: Tensor of shape (batch_size,) with sequence advantages
+            attention_mask: Tensor of shape (batch_size, seq_len) for masking
+            
+        Returns:
+            Tensor of shape (batch_size, seq_len) with token-level advantages
+        """
+        # Expand advantages to token level and mask padding
+        token_advantages = sequence_advantages.unsqueeze(-1).expand(-1, attention_mask.size(1))
+        token_advantages = token_advantages * attention_mask.float()
+        return token_advantages
+
     def compute_kl_divergence(
         self,
-        old_probs: torch.Tensor,
-        new_probs: torch.Tensor
+        old_logits: torch.Tensor,
+        new_logits: torch.Tensor,
+        attention_mask: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute KL divergence between old and new policy distributions.
-        
-        Args:
-            old_probs: Tensor of shape (batch_size, action_dim) containing old probabilities
-            new_probs: Tensor of shape (batch_size, action_dim) containing new probabilities
-            
-        Returns:
-            Scalar tensor containing mean KL divergence
+        Compute KL divergence between old and new token distributions.
         """
-        kl = torch.sum(old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10)), dim=-1)
-        return kl.mean()
-
-    def compute_policy_loss(
-        self,
-        old_probs: torch.Tensor,
-        new_probs: torch.Tensor,
-        advantages: torch.Tensor,
-        actions: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute the clipped policy loss.
+        old_probs = F.softmax(old_logits, dim=-1)
+        new_probs = F.softmax(new_logits, dim=-1)
         
-        Args:
-            old_probs: Tensor of shape (batch_size, action_dim) with old probabilities
-            new_probs: Tensor of shape (batch_size, action_dim) with new probabilities
-            advantages: Tensor of shape (batch_size,) with advantages
-            actions: Tensor of shape (batch_size,) with taken actions
-            
-        Returns:
-            Scalar tensor containing the policy loss
-        """
-        # Get probabilities for taken actions
-        old_action_probs = torch.gather(old_probs, 1, actions.unsqueeze(1)).squeeze()
-        new_action_probs = torch.gather(new_probs, 1, actions.unsqueeze(1)).squeeze()
+        kl = torch.sum(
+            old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10)),
+            dim=-1
+        )
         
-        # Compute probability ratio
-        ratio = new_action_probs / (old_action_probs + 1e-10)
-        
-        # Compute surrogate losses
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - self.config.epsilon, 1 + self.config.epsilon) * advantages
-        
-        return -torch.min(surr1, surr2).mean()
+        # Apply attention mask and average
+        masked_kl = kl * attention_mask.float()
+        return masked_kl.sum() / attention_mask.sum()
 
     def update(
-        self, 
-        states: torch.Tensor,
-        actions: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         rewards: torch.Tensor,
         group_indices: torch.Tensor,
-        old_probs: torch.Tensor
+        old_logits: torch.Tensor
     ) -> Dict[str, float]:
         """
-        Update policy using GRPO algorithm.
+        Update policy using token-level GRPO.
         
         Args:
-            states: Tensor of shape (batch_size, *state_dim) containing input states
-            actions: Tensor of shape (batch_size,) containing taken actions
-            rewards: Tensor of shape (batch_size,) containing rewards
-            group_indices: Tensor of shape (batch_size,) containing group indices
-            old_probs: Tensor of shape (batch_size, action_dim) containing old action probabilities
-            
-        Returns:
-            Dictionary containing training metrics
+            input_ids: Tensor of shape (batch_size, seq_len) with token ids
+            attention_mask: Tensor of shape (batch_size, seq_len) for masking
+            rewards: Tensor of shape (batch_size,) with sequence-level rewards
+            group_indices: Tensor of shape (batch_size,) with group indices
+            old_logits: Tensor of shape (batch_size, seq_len, vocab_size) with old logits
         """
         # Move inputs to device
-        states = states.to(self.device)
-        actions = actions.to(self.device)
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
         rewards = rewards.to(self.device)
         group_indices = group_indices.to(self.device)
-        old_probs = old_probs.to(self.device)
+        old_logits = old_logits.to(self.device)
         
-        # Compute advantages
-        advantages = self.compute_advantages(rewards, group_indices)
+        # Compute sequence-level advantages
+        advantages = self.compute_sequence_level_advantages(rewards, group_indices, attention_mask)
         
-        # Get new action probabilities
-        new_probs = self.policy(states)
+        # Expand to token level
+        token_advantages = self.compute_token_level_advantages(advantages, attention_mask)
+        
+        # Forward pass for new logits
+        outputs = self.model(input_ids, attention_mask=attention_mask)
+        new_logits = outputs.logits
         
         # Compute losses
-        policy_loss = self.compute_policy_loss(old_probs, new_probs, advantages, actions)
-        kl_loss = self.compute_kl_divergence(old_probs, new_probs)
+        policy_loss = self.compute_policy_loss(
+            old_logits, new_logits, token_advantages,
+            input_ids, attention_mask
+        )
+        kl_loss = self.compute_kl_divergence(old_logits, new_logits, attention_mask)
         total_loss = policy_loss + self.config.beta * kl_loss
         
         # Optimize
         self.optimizer.zero_grad()
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
         self.optimizer.step()
         
         return {
@@ -182,44 +188,104 @@ class GRPO:
             "std_advantage": advantages.std().item(),
         }
 
-    @torch.no_grad()
-    def sample_actions(
+    def compute_policy_loss(
         self,
-        states: torch.Tensor,
-        num_samples: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        old_logits: torch.Tensor,
+        new_logits: torch.Tensor,
+        advantages: torch.Tensor,
+        target_ids: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Sample actions from the current policy.
+        Compute token-level policy loss with proper masking.
+        """
+        old_probs = F.softmax(old_logits, dim=-1)
+        new_probs = F.softmax(new_logits, dim=-1)
+        
+        # Get probabilities for actual tokens
+        old_token_probs = torch.gather(
+            old_probs,
+            dim=-1,
+            index=target_ids.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        new_token_probs = torch.gather(
+            new_probs,
+            dim=-1,
+            index=target_ids.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        # Compute probability ratio
+        ratio = new_token_probs / (old_token_probs + 1e-10)
+        
+        # Compute surrogate losses
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(
+            ratio,
+            1 - self.config.epsilon,
+            1 + self.config.epsilon
+        ) * advantages
+        
+        # Apply attention mask and average
+        policy_loss = -torch.min(surr1, surr2) * attention_mask.float()
+        return policy_loss.sum() / attention_mask.sum()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompts: List[str],
+        num_samples: int = 1,
+        **generation_kwargs
+    ) -> Tuple[List[List[str]], torch.Tensor]:
+        """
+        Generate multiple responses for each prompt.
         
         Args:
-            states: Tensor of shape (batch_size, *state_dim) containing input states
-            num_samples: Optional number of samples per state. If None, returns single sample.
+            prompts: List of input prompts
+            num_samples: Number of generations per prompt
+            generation_kwargs: Additional kwargs for model.generate()
             
         Returns:
             Tuple containing:
-                - Tensor of shape (batch_size, num_samples) containing sampled actions
-                - Tensor of shape (batch_size, num_samples, action_dim) containing action probabilities
+                - List of lists of generated texts
+                - Tensor of logits for each generation
         """
-        if num_samples is None:
-            num_samples = 1
-            
-        batch_size = states.shape[0]
-        states = states.to(self.device)
+        # Encode prompts
+        encoded = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.config.max_sequence_length,
+            return_tensors="pt"
+        )
         
-        # Repeat states for multiple samples
-        repeated_states = states.repeat_interleave(num_samples, dim=0)
+        # Repeat inputs for multiple samples
+        input_ids = encoded.input_ids.repeat_interleave(num_samples, dim=0)
+        attention_mask = encoded.attention_mask.repeat_interleave(num_samples, dim=0)
         
-        # Get action probabilities
-        probs = self.policy(repeated_states)
+        # Generate
+        outputs = self.model.generate(
+            input_ids=input_ids.to(self.device),
+            attention_mask=attention_mask.to(self.device),
+            do_sample=True,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            return_dict_in_generate=True,
+            output_scores=True,
+            **generation_kwargs
+        )
         
-        # Sample actions
-        dist = Categorical(probs)
-        actions = dist.sample()
+        # Decode generations
+        generated_sequences = outputs.sequences.cpu()
+        logits = torch.stack(outputs.scores, dim=1)  # Shape: (batch_size, seq_len, vocab_size)
         
-        # Reshape outputs
-        actions = actions.view(batch_size, num_samples)
-        probs = probs.view(batch_size, num_samples, -1)
+        # Convert to texts
+        generated_texts = []
+        for i in range(0, len(generated_sequences), num_samples):
+            batch_texts = self.tokenizer.batch_decode(
+                generated_sequences[i:i+num_samples, encoded.input_ids.size(1):],
+                skip_special_tokens=True
+            )
+            generated_texts.append(batch_texts)
         
-        return actions, probs
-    
-
+        return generated_texts, logits
