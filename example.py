@@ -17,7 +17,7 @@ from transformers import (
     AutoTokenizer,
 )
 
-from openr1.main import GRPO, GRPOConfig
+from r_torch.main import GRPO, GRPOConfig
 
 
 class SimpleRewardModel:

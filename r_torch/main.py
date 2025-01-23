@@ -4,7 +4,6 @@ generation and appropriate masking for variable-length sequences.
 """
 
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
